@@ -1,0 +1,173 @@
+####DADA2 for 16S sequence treatment
+
+library(dada2)
+
+path <- "metals/16S"
+database <- "/databases/rdp_train_set_18.fa.gz"
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft=c(19,20), truncLen=c(240,200),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+write.table(out, "trimming.txt")
+
+### Dereplication
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+
+###DADA algorithm
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+### Sample Inference
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+####Merging
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+
+###Create ASV table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+slen<-table(nchar(getSequences(seqtab)))
+write.table(slen, "sequencelength.txt")
+
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 200:300]
+
+####Remove chimeras
+
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+
+###Know how many reads made it through all the steps
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+write.table(track, "stats.txt")
+
+## Give Seq headers more manageable names
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+## Make and writing out a fasta of the final ASV seqs
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "out_ASVs.fa")
+
+## ASV count table 
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "out_ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+### Assign taxonomy - Bayesian classifier
+taxa <- assignTaxonomy(seqtab.nochim, database, multithread=TRUE)
+row.names(taxa) <- sub(">", "", asv_headers)
+write.table(taxa, file = "out_taxa.txt", append = FALSE, quote = TRUE, sep = "\t")
+
+################################################################################################
+
+########16S rRNA gene sequence analysis (after sequence treatment using DADA2)#####
+########All the steps are done using R
+
+#####Decontamination using decontam
+
+##Create phyloseq object
+otumat<-read.table("out_ASVs_counts.tsv", header=TRUE)
+taxmat<-read.table("out_taxa.txt", header=TRUE)
+taxmat<-as.matrix(taxmat)
+
+library("phyloseq")
+OTU = otu_table(otumat, taxa_are_rows = TRUE)
+TAX = tax_table(taxmat)
+physeq = phyloseq(OTU, TAX)
+sam.data2 <- read.table("meta_data.txt", header = FALSE, row.names = 1) # A file containing info about sample type (sample vs negative control)
+row.names(sam.data2)
+sample_data(physeq)<- sam.data2 #add sample data 
+
+#clean-up using prevalence" method. In this method, the prevalence (presence/absence across samples) 
+library(decontam)
+sample_data(physeq)$is.neg <- sample_data(physeq)$V2 == "control"
+contamdf.prev <- isContaminant(physeq, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+contamdf.prev05 <- isContaminant(physeq, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05$contaminant)
+
+#Make phyloseq object of presence-absence in negative controls and true samples
+physeq.pa <- transform_sample_counts(physeq, function(abund) 1*(abund>0))
+physeq.pa.neg <- prune_samples(sample_data(physeq.pa)$V2 == "control", physeq.pa)
+physeq.pa.pos <- prune_samples(sample_data(physeq.pa)$V2 == "sample", physeq.pa)
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(physeq.pa.pos), pa.neg=taxa_sums(physeq.pa.neg),
+                    contaminant=contamdf.prev05$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+contaminants<- df.pa[df.pa[, "contaminant"] == "FALSE",]
+noncontaminants <- row.names(contaminants)
+otu.table <- as(otu_table(physeq), "matrix")
+otu.clean <- otu.table[row.names(otu.table) %in% noncontaminants,]
+tax.clean <- as(tax_table(physeq), "matrix")
+tax.clean <- tax.clean[row.names(tax.clean) %in% noncontaminants,]
+
+ps1 = phyloseq(otu_table(otu.clean, taxa_are_rows=TRUE), tax_table(tax.clean))
+otu_table(ps1)
+
+saveRDS(ps1, "phyloseq_decontam.rds")
+
+####Step 1: clean-up output from DADA2 using Phyloseq
+
+######Take out sequences that have not been annotated at least to the class level, as well as chloroplasts
+physeq_class <- subset_taxa(ps1, Class != "NA")
+physeq_class2 <- subset_taxa(physeq_class, Class != "Chloroplast")
+
+####Remove ASVs with less than 10 total copies (taking all samples into account)
+physeq_class3 = prune_samples(sample_sums(physeq_class2)>=10, physeq_class2)
+###Save cleaned-up ASV abundance table and associated taxonomy
+OTU = as(otu_table(physeq_class3), "matrix")
+write.table(OTU, "otu_asvs_classlevel.txt")
+TAXA = as(tax_table(physeq_class3), "matrix")
+write.table(TAXA, "taxa_asvs_classlevel.txt")
+
+####Diversity estimation
+library(vegan)
+diversity(OTU, index = "shannon")
+
+####NMDS and PERMANOVA
+
+library(readr)
+relab <- read_table("otu_asvs_classlevel.txt")
+metadata <- read_table("metadata.txt")  ###metadata table include sampling day, condition and replicate
+library(vegan)
+NMDS <- metaMDS(relab,distance = "bray")
+NMDS
+NMDS[["points"]]
+
+#Permanova test
+adonis2(relab ~ temperature*time, data = metadata)
+###For pollutant PERMANOVA analysis, a subtable was made with polluted samples from day 27 and the metadata table contained pollutant concentrations per sample
+
+####Merge ASVs by genera
+genus = tax_glom(physeq_class3, "Genus")
